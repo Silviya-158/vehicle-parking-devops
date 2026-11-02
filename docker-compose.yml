@@ -98,7 +98,7 @@ services:
     volumes:
       - ./monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
       - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
-      - ./monitoring/grafana/parking-dashboard.json:/var/lib/grafana/dashboards/parking-dashboard.json:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     ports:
       - "${GRAFANA_PORT:-3001}:3000"

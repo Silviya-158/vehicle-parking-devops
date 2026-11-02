@@ -15,7 +15,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
       },
@@ -26,14 +26,14 @@
       "type": "timeseries",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(http_server_requests_seconds_count[1m])) by (uri)",
           "legendFormat": "{{uri}}"
         }
       ]
     },
     {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" }
       },
@@ -43,14 +43,14 @@
       "type": "timeseries",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "http_server_requests_seconds_max",
           "legendFormat": "{{uri}}"
         }
       ]
     },
     {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" }
       },
@@ -60,14 +60,14 @@
       "type": "timeseries",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(jvm_memory_used_bytes) by (area)",
           "legendFormat": "{{area}}"
         }
       ]
     },
     {
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit" }
       },
@@ -77,12 +77,12 @@
       "type": "timeseries",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "system_cpu_usage",
           "legendFormat": "System CPU"
         },
         {
-          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "process_cpu_usage",
           "legendFormat": "Process CPU"
         }
