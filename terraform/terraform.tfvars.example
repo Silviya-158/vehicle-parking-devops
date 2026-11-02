@@ -1,9 +1,46 @@
-aws_region        = "us-east-1"
-environment       = "production"
-project_name      = "parkflow"
-instance_type     = "t3.medium"
-db_instance_class = "db.t3.micro"
-db_name           = "parking_db"
-db_username       = "parking_admin"
-db_password       = "ReplaceWithSecurePassword2026!"
-ssh_public_key    = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+# ============================================================
+# Example Terraform Variables Configuration (terraform.tfvars)
+# Copy this file to 'terraform.tfvars' to customize your deployment.
+# ============================================================
+
+# 1. AWS Region (Singapore)
+aws_region = "ap-southeast-1"
+
+# 2. Project & Environment Identifiers
+project_name = "parkflow"
+environment  = "dev"
+
+# 3. Network Configuration
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+availability_zone  = "ap-southeast-1a"
+
+# 4. EC2 Compute & Storage Configuration
+# t3.small provides 2 vCPU and 2GB RAM (cost-effective for Docker Compose)
+# t3.medium provides 2 vCPU and 4GB RAM (recommended if running full build tools)
+instance_type    = "t3.small"
+root_volume_size = 20
+
+# 5. Amazon Linux 2023 AMI in Singapore (ap-southeast-1)
+# Pre-set with verified AL2023 x86_64 image ID for ap-southeast-1
+ami_id = "ami-0b44053e20e335ab8"
+
+# 6. Admin Security Restrictions (SSH, Grafana, Debug Ports)
+# Strictly restricts administrative access to your public IP.
+# Check your current IP at https://checkip.amazonaws.com
+allowed_ssh_cidr = "103.185.85.34/32"
+
+# 7. SSH Key Pair Options (Choose ONE of the following, or leave blank to use AWS SSM)
+# Option A: If you created an EC2 Key Pair in AWS Console (Singapore region):
+# ssh_key_name = "parkflow-key"
+
+# Option B: If you want Terraform to import your local public key:
+# ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@example.com"
+
+# Note: Even without an SSH key, you can connect securely using AWS Systems Manager
+# (Session Manager) directly from the AWS Management Console or AWS CLI.
+
+# 8. CloudWatch Monitoring
+# false = Basic 5-minute metrics (Free Tier)
+# true  = Detailed 1-minute metrics
+enable_detailed_monitoring = false
