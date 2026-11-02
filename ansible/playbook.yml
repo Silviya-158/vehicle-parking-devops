@@ -1,0 +1,68 @@
+---
+- name: Deploy ParkFlow Vehicle Parking Slot Management System
+  hosts: parking_servers
+  become: true
+  vars:
+    app_dir: /opt/vehicle-parking-devops
+    git_repo: "https://github.com/your-org/vehicle-parking-devops.git"
+    git_branch: "main"
+
+  tasks:
+    - name: Update apt repository cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - git
+          - ufw
+        state: present
+
+    - name: Ensure Docker service is running and enabled
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy project files or checkout Git repository
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        owner: ubuntu
+        group: ubuntu
+      ignore_errors: yes
+
+    - name: Deploy Docker Compose stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        state: present
+        build: always
+      become_user: ubuntu
+
+    - name: Wait for backend health check
+      uri:
+        url: "http://localhost:8080/api/health"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 15
+      delay: 5
+
+    - name: Confirm deployment status
+      debug:
+        msg: "ParkFlow stack deployed successfully! Health endpoint returned 200 OK."

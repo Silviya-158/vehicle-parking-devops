@@ -1,0 +1,107 @@
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY = 'docker.io'
+        IMAGE_BACKEND = 'your-dockerhub/parkflow-backend'
+        IMAGE_FRONTEND = 'your-dockerhub/parkflow-frontend'
+        TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT ? env.GIT_COMMIT.take(7) : 'latest'}"
+        DOCKER_CREDS = credentials('docker-hub-credentials')
+        SSH_KEY = credentials('ec2-deploy-ssh-key')
+    }
+
+    tools {
+        maven 'Maven-3.9'
+        jdk 'Java-21'
+        nodejs 'Node-20'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout Source') {
+            steps {
+                checkout scm
+                echo "Building ParkFlow CI/CD Pipeline - Commit: ${env.GIT_COMMIT}"
+            }
+        }
+
+        stage('Backend: Unit Tests & Build') {
+            steps {
+                dir('backend') {
+                    sh 'mvn clean test package'
+                }
+            }
+            post {
+                always {
+                    junit 'backend/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Frontend: Lint & Build') {
+            steps {
+                dir('frontend') {
+                    sh 'npm ci'
+                    sh 'npm run build'
+                }
+            }
+        }
+
+        stage('Docker: Build Images') {
+            steps {
+                script {
+                    echo "Building Docker images for tag: ${TAG}"
+                    sh "docker build -t ${IMAGE_BACKEND}:${TAG} -t ${IMAGE_BACKEND}:latest ./backend"
+                    sh "docker build -t ${IMAGE_FRONTEND}:${TAG} -t ${IMAGE_FRONTEND}:latest ./frontend"
+                }
+            }
+        }
+
+        stage('Docker: Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh "echo \$DOCKER_CREDS_PSW | docker login -u \$DOCKER_CREDS_USR --password-stdin"
+                    sh "docker push ${IMAGE_BACKEND}:${TAG}"
+                    sh "docker push ${IMAGE_BACKEND}:latest"
+                    sh "docker push ${IMAGE_FRONTEND}:${TAG}"
+                    sh "docker push ${IMAGE_FRONTEND}:latest"
+                }
+            }
+        }
+
+        stage('Deploy to Staging / Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Deploying via Docker Compose or Ansible to Target Host..."
+                    sh '''
+                        docker compose down || true
+                        docker compose up -d --build
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "ParkFlow CI/CD Pipeline completed successfully!"
+        }
+        failure {
+            echo "ParkFlow CI/CD Pipeline failed. Please check build logs."
+        }
+        cleanup {
+            cleanWs()
+        }
+    }
+}
