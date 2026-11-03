@@ -89,10 +89,11 @@ jobs:
           echo "Docker Compose configuration is valid."
 
   # ============================================================================
-  # Job 4 – Production Deployment (Manual Approval Gate via workflow_dispatch)
+  # ============================================================================
+  # Job 4 – Production Deployment via AWS Systems Manager (SSM Run Command)
   # ============================================================================
   deploy:
-    name: Production Deployment
+    name: Production Deployment (AWS SSM)
     needs: [frontend-build, backend-ci, docker-validation]
     runs-on: ubuntu-latest
     # Pushes and pull requests must NEVER trigger deployment automatically.
@@ -102,124 +103,170 @@ jobs:
       name: production
       url: http://32.236.126.38
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
-      - name: Configure Verified SSH Known Hosts
+      - name: Configure AWS Credentials (GitHub OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - name: Deploy ParkFlow via AWS Systems Manager
         env:
-          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          HOST_KEY: ${{ secrets.EC2_HOST_KEY }}
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID || 'i-06229b4495e62654' }}
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          set -euo pipefail
 
-          # Set up private key
-          echo "$SSH_KEY" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
+          echo "=================================================="
+          echo "Preparing AWS SSM Deployment Payload"
+          echo "Target Instance: $INSTANCE_ID"
+          echo "=================================================="
 
-          # Independently verified and pinned host-key verification
-          if [ -z "$HOST_KEY" ]; then
-            echo "ERROR: Secret EC2_HOST_KEY is missing! Pinned host-key verification is strictly required."
-            echo "Please add the pinned EC2 public host key to GitHub Repository Secrets as EC2_HOST_KEY."
+          cat << 'EOF' > deploy-payload.sh
+          set -euo pipefail
+          echo "=================================================="
+          echo "Starting ParkFlow Deployment on EC2 via AWS SSM"
+          echo "=================================================="
+
+          cd /home/ec2-user/vehicle-parking-devops
+
+          # 1. Verify and preserve existing production .env file
+          if [ ! -f .env ]; then
+            echo "ERROR: Production .env file is missing in /home/ec2-user/vehicle-parking-devops!"
+            exit 1
+          fi
+          echo "[PASS] Production .env file is present and preserved."
+
+          # 2. Check for unexpected tracked or untracked changes before repository reset
+          LOCAL_CHANGES=$(sudo -u ec2-user git status --porcelain)
+          if [ -n "$LOCAL_CHANGES" ]; then
+            echo "=================================================="
+            echo "ABORTING DEPLOYMENT: Unexpected local modifications found on EC2:"
+            echo "$LOCAL_CHANGES"
+            echo "=================================================="
+            exit 1
+          fi
+          echo "[PASS] Working directory is clean of unexpected tracked and untracked modifications."
+
+          # 3. Pull latest code from main
+          echo "Fetching and synchronizing with origin/main..."
+          sudo -u ec2-user git fetch origin main
+          sudo -u ec2-user git checkout main
+          sudo -u ec2-user git reset --hard origin/main
+
+          # 4. Rebuild ONLY application images (frontend & backend)
+          echo "Building application container images (frontend and backend)..."
+          sudo -u ec2-user docker compose build frontend backend
+
+          # 5. Update ONLY frontend and backend containers (PostgreSQL, Prometheus, and Grafana remain untouched)
+          echo "Restarting frontend and backend services..."
+          sudo -u ec2-user docker compose up -d frontend backend
+
+          # 6. Post-deployment Health Checks
+          echo "Running deployment health checks..."
+
+          # Backend Health Check
+          echo "Checking Backend health endpoint (http://localhost:8081/api/health)..."
+          BACKEND_HEALTHY=0
+          for i in $(seq 1 30); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/api/health || true)
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "SUCCESS: Backend health endpoint returned HTTP 200 (attempt ${i})."
+              BACKEND_HEALTHY=1
+              break
+            fi
+            echo "Waiting for Backend to become ready... (attempt ${i}/30, status: ${HTTP_STATUS})"
+            sleep 2
+          done
+
+          if [ "$BACKEND_HEALTHY" -ne 1 ]; then
+            echo "ERROR: Backend health check failed or timed out!"
+            sudo -u ec2-user docker compose logs --tail 50 backend
             exit 1
           fi
 
-          echo "$HOST_KEY" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
-          echo "[PASS] Independently verified host key loaded into known_hosts."
+          # Frontend Health Check
+          echo "Checking Frontend web server (http://localhost:80/)..."
+          FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80/ || true)
+          if [ "$FRONTEND_STATUS" -eq 200 ]; then
+            echo "SUCCESS: Frontend web server returned HTTP 200."
+          else
+            echo "WARNING: Frontend returned HTTP ${FRONTEND_STATUS}"
+          fi
 
-      - name: Deploy to EC2 via SSH
-        env:
-          HOST: ${{ secrets.EC2_HOST }}
-          USER: ${{ secrets.EC2_USER }}
-          PORT: ${{ secrets.EC2_PORT || '22' }}
-        run: |
-          ssh -o StrictHostKeyChecking=yes -p "$PORT" -i ~/.ssh/ec2_key "$USER@$HOST" '
-            set -euo pipefail
+          # API via Nginx Proxy Health Check
+          echo "Checking Backend via Nginx proxy (http://localhost:80/api/health)..."
+          PROXY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80/api/health || true)
+          if [ "$PROXY_STATUS" -eq 200 ]; then
+            echo "SUCCESS: Nginx API reverse proxy returned HTTP 200."
+          else
+            echo "WARNING: Nginx API proxy returned HTTP ${PROXY_STATUS}"
+          fi
 
+          # Container Status Overview
+          echo "=================================================="
+          echo "Container Status Summary:"
+          sudo -u ec2-user docker compose ps
+          echo "=================================================="
+          echo "ParkFlow Deployment Completed Successfully via AWS SSM!"
+          EOF
+
+          # Format commands array for SSM SendCommand
+          COMMAND_JSON=$(jq -n --rawfile script deploy-payload.sh '{"commands": [$script]}')
+
+          echo "Sending command to AWS SSM..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "ParkFlow deployment via GitHub Actions OIDC" \
+            --parameters "$COMMAND_JSON" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command sent successfully!"
+          echo "Command ID: $COMMAND_ID"
+
+          # Poll for SSM command completion
+          echo "Polling SSM execution status..."
+          STATUS="InProgress"
+          for i in $(seq 1 60); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "SSM Command Status: $STATUS (check $i/60)"
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM Command execution completed with status: Success"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "ERROR: SSM Command terminated with status: $STATUS"
+              break
+            fi
+          done
+
+          echo "=================================================="
+          echo "SSM Command Execution Log (Standard Output):"
+          echo "=================================================="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text
+
+          if [ "$STATUS" != "Success" ]; then
             echo "=================================================="
-            echo "Starting ParkFlow Deployment on EC2"
+            echo "SSM Command Execution Error Log (Standard Error):"
             echo "=================================================="
-
-            cd /home/ec2-user/vehicle-parking-devops
-
-            # 1. Verify and preserve existing production .env file
-            if [ ! -f .env ]; then
-              echo "ERROR: Production .env file is missing in /home/ec2-user/vehicle-parking-devops!"
-              echo "Aborting deployment to avoid running unconfigured application."
-              exit 1
-            fi
-            echo "[PASS] Production .env file is present and preserved."
-
-            # 2. Check for unexpected tracked or untracked changes before repository reset
-            LOCAL_CHANGES=$(git status --porcelain)
-            if [ -n "$LOCAL_CHANGES" ]; then
-              echo "=================================================="
-              echo "ABORTING DEPLOYMENT: Unexpected local modifications found on EC2:"
-              echo "$LOCAL_CHANGES"
-              echo "=================================================="
-              echo "Deployment aborted to protect local working tree."
-              exit 1
-            fi
-            echo "[PASS] Working directory is clean of unexpected tracked and untracked modifications."
-
-            # 3. Pull latest code from main
-            echo "Fetching and synchronizing with origin/main..."
-            git fetch origin main
-            git checkout main
-            git reset --hard origin/main
-
-            # 4. Rebuild ONLY application images (frontend & backend)
-            echo "Building application container images (frontend and backend)..."
-            docker compose build frontend backend
-
-            # 5. Update ONLY frontend and backend containers (PostgreSQL, Prometheus, and Grafana remain untouched)
-            echo "Restarting frontend and backend services..."
-            docker compose up -d frontend backend
-
-            # 6. Post-deployment Health Checks
-            echo "Running deployment health checks..."
-
-            # Backend Health Check
-            echo "Checking Backend health endpoint (http://localhost:8081/api/health)..."
-            BACKEND_HEALTHY=0
-            for i in $(seq 1 30); do
-              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/api/health || true)
-              if [ "$HTTP_STATUS" -eq 200 ]; then
-                echo "SUCCESS: Backend health endpoint returned HTTP 200 (attempt ${i})."
-                BACKEND_HEALTHY=1
-                break
-              fi
-              echo "Waiting for Backend to become ready... (attempt ${i}/30, status: ${HTTP_STATUS})"
-              sleep 2
-            done
-
-            if [ "$BACKEND_HEALTHY" -ne 1 ]; then
-              echo "ERROR: Backend health check failed or timed out!"
-              docker compose logs --tail 50 backend
-              exit 1
-            fi
-
-            # Frontend Health Check
-            echo "Checking Frontend web server (http://localhost:80/)..."
-            FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80/ || true)
-            if [ "$FRONTEND_STATUS" -eq 200 ]; then
-              echo "SUCCESS: Frontend web server returned HTTP 200."
-            else
-              echo "WARNING: Frontend returned HTTP ${FRONTEND_STATUS}"
-            fi
-
-            # API via Nginx Proxy Health Check
-            echo "Checking Backend via Nginx proxy (http://localhost:80/api/health)..."
-            PROXY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80/api/health || true)
-            if [ "$PROXY_STATUS" -eq 200 ]; then
-              echo "SUCCESS: Nginx API reverse proxy returned HTTP 200."
-            else
-              echo "WARNING: Nginx API proxy returned HTTP ${PROXY_STATUS}"
-            fi
-
-            # Container Status Overview
-            echo "=================================================="
-            echo "Container Status Summary:"
-            docker compose ps
-            echo "=================================================="
-            echo "ParkFlow Deployment Completed Successfully!"
-          '
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardErrorContent" \
+              --output text
+            exit 1
+          fi
