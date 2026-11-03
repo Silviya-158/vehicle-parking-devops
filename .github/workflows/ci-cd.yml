@@ -8,6 +8,12 @@ name: ParkFlow CI/CD Pipeline
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      deploy_to_production:
+        description: 'Deploy to EC2 production environment after CI checks pass'
+        required: true
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,10 +21,10 @@ concurrency:
 
 jobs:
   # ============================================================================
-  # 1. FRONTEND: Build & Bundle Validation
+  # Job 1 – Frontend Build & Bundle Validation
   # ============================================================================
-  frontend-build-validation:
-    name: Frontend (Build & Bundle Validation)
+  frontend-build:
+    name: Frontend Build
     runs-on: ubuntu-latest
 
     steps:
@@ -36,15 +42,15 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Validate Frontend Production Build
+      - name: Build frontend production bundle
         working-directory: frontend
         run: npm run build
 
   # ============================================================================
-  # 2. BACKEND: Build & Automated Tests
+  # Job 2 – Backend Build and Tests
   # ============================================================================
   backend-ci:
-    name: Backend (Build & Test)
+    name: Backend Build and Tests
     runs-on: ubuntu-latest
 
     steps:
@@ -67,7 +73,7 @@ jobs:
         run: mvn package -DskipTests
 
   # ============================================================================
-  # 3. DOCKER COMPOSE: Specification Validation
+  # Job 3 – Docker Compose Validation
   # ============================================================================
   docker-validation:
     name: Docker Compose Validation
@@ -83,28 +89,42 @@ jobs:
           echo "Docker Compose configuration is valid."
 
   # ============================================================================
-  # 4. CONTINUOUS DEPLOYMENT: AWS EC2 (main branch only)
+  # Job 4 – Production Deployment (Manual Approval Gate via workflow_dispatch)
   # ============================================================================
   deploy:
-    name: Deploy to EC2
-    needs: [frontend-build-validation, backend-ci, docker-validation]
+    name: Production Deployment
+    needs: [frontend-build, backend-ci, docker-validation]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Pushes and pull requests must NEVER trigger deployment automatically.
+    # Deployment runs ONLY via manual workflow_dispatch when deploy_to_production is true.
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_to_production == true
+    environment:
+      name: production
+      url: http://${{ secrets.EC2_HOST }}:80
 
     steps:
-      - name: Configure SSH and Known Hosts
+      - name: Configure Verified SSH Known Hosts
         env:
           SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          HOST: ${{ secrets.EC2_HOST }}
-          PORT: ${{ secrets.EC2_PORT || '22' }}
+          HOST_KEY: ${{ secrets.EC2_HOST_KEY }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+
+          # Set up private key
           echo "$SSH_KEY" > ~/.ssh/ec2_key
           chmod 600 ~/.ssh/ec2_key
-          # Secure host-key verification via known_hosts
-          ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts
+
+          # Independently verified and pinned host-key verification
+          if [ -z "$HOST_KEY" ]; then
+            echo "ERROR: Secret EC2_HOST_KEY is missing! Pinned host-key verification is strictly required."
+            echo "Please add the pinned EC2 public host key to GitHub Repository Secrets as EC2_HOST_KEY."
+            exit 1
+          fi
+
+          echo "$HOST_KEY" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
+          echo "[PASS] Independently verified host key loaded into known_hosts."
 
       - name: Deploy to EC2 via SSH
         env:
@@ -116,7 +136,7 @@ jobs:
             set -euo pipefail
 
             echo "=================================================="
-            echo "Starting ParkFlow Automated Deployment on EC2"
+            echo "Starting ParkFlow Deployment on EC2"
             echo "=================================================="
 
             cd /home/ec2-user/vehicle-parking-devops
@@ -129,17 +149,17 @@ jobs:
             fi
             echo "[PASS] Production .env file is present and preserved."
 
-            # 2. Check for unexpected uncommitted tracked changes before repository reset
-            LOCAL_CHANGES=$(git status --porcelain -uno)
+            # 2. Check for unexpected tracked or untracked changes before repository reset
+            LOCAL_CHANGES=$(git status --porcelain)
             if [ -n "$LOCAL_CHANGES" ]; then
-              echo "WARNING: Detected unexpected local modifications in tracked files:"
+              echo "=================================================="
+              echo "ABORTING DEPLOYMENT: Unexpected local modifications found on EC2:"
               echo "$LOCAL_CHANGES"
-              BACKUP_BRANCH="backup-pre-deploy-$(date +%Y%m%d_%H%M%S)"
-              echo "Creating backup branch: ${BACKUP_BRANCH}..."
-              git branch "$BACKUP_BRANCH" || true
-            else
-              echo "[PASS] Working directory has no unexpected tracked changes."
+              echo "=================================================="
+              echo "Deployment aborted to protect local working tree."
+              exit 1
             fi
+            echo "[PASS] Working directory is clean of unexpected tracked and untracked modifications."
 
             # 3. Pull latest code from main
             echo "Fetching and synchronizing with origin/main..."
@@ -185,6 +205,15 @@ jobs:
               echo "SUCCESS: Frontend web server returned HTTP 200."
             else
               echo "WARNING: Frontend returned HTTP ${FRONTEND_STATUS}"
+            fi
+
+            # API via Nginx Proxy Health Check
+            echo "Checking Backend via Nginx proxy (http://localhost:80/api/health)..."
+            PROXY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80/api/health || true)
+            if [ "$PROXY_STATUS" -eq 200 ]; then
+              echo "SUCCESS: Nginx API reverse proxy returned HTTP 200."
+            else
+              echo "WARNING: Nginx API proxy returned HTTP ${PROXY_STATUS}"
             fi
 
             # Container Status Overview
