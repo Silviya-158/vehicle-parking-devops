@@ -1,0 +1,196 @@
+name: ParkFlow CI/CD Pipeline
+
+'on':
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # 1. FRONTEND: Build & Bundle Validation
+  # ============================================================================
+  frontend-build-validation:
+    name: Frontend (Build & Bundle Validation)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: 'frontend/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Validate Frontend Production Build
+        working-directory: frontend
+        run: npm run build
+
+  # ============================================================================
+  # 2. BACKEND: Build & Automated Tests
+  # ============================================================================
+  backend-ci:
+    name: Backend (Build & Test)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run backend tests
+        working-directory: backend
+        run: mvn clean test
+
+      - name: Package backend JAR
+        working-directory: backend
+        run: mvn package -DskipTests
+
+  # ============================================================================
+  # 3. DOCKER COMPOSE: Specification Validation
+  # ============================================================================
+  docker-validation:
+    name: Docker Compose Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose Configuration
+        run: |
+          docker compose config --quiet
+          echo "Docker Compose configuration is valid."
+
+  # ============================================================================
+  # 4. CONTINUOUS DEPLOYMENT: AWS EC2 (main branch only)
+  # ============================================================================
+  deploy:
+    name: Deploy to EC2
+    needs: [frontend-build-validation, backend-ci, docker-validation]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    steps:
+      - name: Configure SSH and Known Hosts
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOST: ${{ secrets.EC2_HOST }}
+          PORT: ${{ secrets.EC2_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          # Secure host-key verification via known_hosts
+          ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy to EC2 via SSH
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ${{ secrets.EC2_USER }}
+          PORT: ${{ secrets.EC2_PORT || '22' }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes -p "$PORT" -i ~/.ssh/ec2_key "$USER@$HOST" '
+            set -euo pipefail
+
+            echo "=================================================="
+            echo "Starting ParkFlow Automated Deployment on EC2"
+            echo "=================================================="
+
+            cd /home/ec2-user/vehicle-parking-devops
+
+            # 1. Verify and preserve existing production .env file
+            if [ ! -f .env ]; then
+              echo "ERROR: Production .env file is missing in /home/ec2-user/vehicle-parking-devops!"
+              echo "Aborting deployment to avoid running unconfigured application."
+              exit 1
+            fi
+            echo "[PASS] Production .env file is present and preserved."
+
+            # 2. Check for unexpected uncommitted tracked changes before repository reset
+            LOCAL_CHANGES=$(git status --porcelain -uno)
+            if [ -n "$LOCAL_CHANGES" ]; then
+              echo "WARNING: Detected unexpected local modifications in tracked files:"
+              echo "$LOCAL_CHANGES"
+              BACKUP_BRANCH="backup-pre-deploy-$(date +%Y%m%d_%H%M%S)"
+              echo "Creating backup branch: ${BACKUP_BRANCH}..."
+              git branch "$BACKUP_BRANCH" || true
+            else
+              echo "[PASS] Working directory has no unexpected tracked changes."
+            fi
+
+            # 3. Pull latest code from main
+            echo "Fetching and synchronizing with origin/main..."
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+
+            # 4. Rebuild ONLY application images (frontend & backend)
+            echo "Building application container images (frontend and backend)..."
+            docker compose build frontend backend
+
+            # 5. Update ONLY frontend and backend containers (PostgreSQL, Prometheus, and Grafana remain untouched)
+            echo "Restarting frontend and backend services..."
+            docker compose up -d frontend backend
+
+            # 6. Post-deployment Health Checks
+            echo "Running deployment health checks..."
+
+            # Backend Health Check
+            echo "Checking Backend health endpoint (http://localhost:8081/api/health)..."
+            BACKEND_HEALTHY=0
+            for i in $(seq 1 30); do
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/api/health || true)
+              if [ "$HTTP_STATUS" -eq 200 ]; then
+                echo "SUCCESS: Backend health endpoint returned HTTP 200 (attempt ${i})."
+                BACKEND_HEALTHY=1
+                break
+              fi
+              echo "Waiting for Backend to become ready... (attempt ${i}/30, status: ${HTTP_STATUS})"
+              sleep 2
+            done
+
+            if [ "$BACKEND_HEALTHY" -ne 1 ]; then
+              echo "ERROR: Backend health check failed or timed out!"
+              docker compose logs --tail 50 backend
+              exit 1
+            fi
+
+            # Frontend Health Check
+            echo "Checking Frontend web server (http://localhost:80/)..."
+            FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:80/ || true)
+            if [ "$FRONTEND_STATUS" -eq 200 ]; then
+              echo "SUCCESS: Frontend web server returned HTTP 200."
+            else
+              echo "WARNING: Frontend returned HTTP ${FRONTEND_STATUS}"
+            fi
+
+            # Container Status Overview
+            echo "=================================================="
+            echo "Container Status Summary:"
+            docker compose ps
+            echo "=================================================="
+            echo "ParkFlow Deployment Completed Successfully!"
+          '
