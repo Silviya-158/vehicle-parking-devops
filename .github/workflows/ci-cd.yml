@@ -97,10 +97,10 @@ jobs:
     runs-on: ubuntu-latest
     # Pushes and pull requests must NEVER trigger deployment automatically.
     # Deployment runs ONLY via manual workflow_dispatch when deploy_to_production is true.
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy_to_production == true
+    if: github.event_name == 'workflow_dispatch' && (inputs.deploy_to_production == true || github.event.inputs.deploy_to_production == 'true')
     environment:
       name: production
-      url: http://${{ secrets.EC2_HOST }}:80
+      url: http://32.236.126.38
 
     steps:
       - name: Configure Verified SSH Known Hosts
